@@ -27,6 +27,7 @@ import torch.nn as nn
 from fairseq.data.dictionary import Dictionary
 from fairseq.models.transformer import Embedding, TransformerEncoder
 from fairseq.modules import LayerNorm
+from tqdm.auto import tqdm
 
 from laser_encoders.download_models import LaserModelDownloader
 from laser_encoders.language_list import LASER2_LANGUAGE, LASER3_LANGUAGE
@@ -117,10 +118,7 @@ class SentenceEncoder:
             encoded_batch = self.encoder(tokens, lengths)
 
         for key, values in encoded_batch.items():
-            if isinstance(values, torch.Tensor):
-                encoded_batch[key] = values.detach().cpu().numpy()
-            elif isinstance(values, tuple):
-                encoded_batch[key] = tuple(v.detach().cpu().numpy() for v in values)
+            encoded_batch[key] = values.detach().cpu().numpy()
 
         return encoded_batch
 
@@ -176,10 +174,25 @@ class SentenceEncoder:
         if nsentences > 0:
             yield batch(batch_tokens, batch_lengths, batch_indices)
 
-    def encode_sentences(self, sentences, normalize_embeddings=False):
+    def encode_sentences(
+        self,
+        sentences,
+        normalize_embeddings=False,
+    ):
         indices = []
-        results = {}
-        for batch, batch_indices in self._make_batches(sentences):
+        results = {
+            "sentemb": [],
+            "encoder_out": [],
+            "encoder_padding_mask": [],
+        }
+        max_tokens = -np.inf
+        if self.max_sentences is None:
+            n_batches = len(sentences)
+        else:
+            n_batches = int(np.ceil(len(sentences) / self.max_sentences))
+        for batch, batch_indices in tqdm(
+            self._make_batches(sentences), total=n_batches
+        ):
             indices.extend(batch_indices)
             encoded_batch = self._process_batch(batch)
             if normalize_embeddings:
@@ -191,28 +204,30 @@ class SentenceEncoder:
                 )
                 encoded_batch["sentemb"] /= norms
             for key, values in encoded_batch.items():
-                if isinstance(values, tuple):
-                    if key not in results:
-                        results[key] = tuple([] for _ in values)
-                    for i, v in enumerate(values):
-                        results[key][i].append(v)
-                elif isinstance(values, np.ndarray):
-                    if key not in results:
-                        results[key] = []
-                    results[key].append(values)
+                results[key].append(values)
+                if key == "encoder_out":
+                    max_tokens = max(max_tokens, values.shape[1])
 
-        for key, values in results.items():
-            if isinstance(values[0], np.ndarray):
-                results[key] = [
-                    values[i] for i in np.argsort(indices, kind=self.sort_kind)
-                ]
-            elif isinstance(values, tuple):
-                results[key] = tuple(
-                    [v[i] for i in np.argsort(indices, kind=self.sort_kind)]
-                    for v in values
-                )
+        sentemb = np.concatenate(results["sentemb"], axis=0)
+        encoder_out = np.full(
+            (len(sentences), max_tokens, sentemb.shape[1]),
+            -np.inf,
+        )
+        encoder_padding_mask = np.full((len(sentences), max_tokens), True)
+        start = 0
+        for e, p in zip(results["encoder_out"], results["encoder_padding_mask"]):
+            end = start + e.shape[0]
+            n_tokens = e.shape[1]
+            encoder_out[start:end, :n_tokens] = e
+            encoder_padding_mask[start:end, :n_tokens] = p
+            start = end
 
-        return results
+        indices = np.argsort(indices, kind=self.sort_kind)
+        return {
+            "sentemb": sentemb[indices],
+            "encoder_out": encoder_out[indices],
+            "encoder_padding_mask": encoder_padding_mask[indices],
+        }
 
 
 class LaserTransformerEncoder(TransformerEncoder):
@@ -362,11 +377,8 @@ class LaserLstmEncoder(nn.Module):
 
         return {
             "sentemb": sentemb,
-            "encoder_out": (x, final_hiddens, final_cells),
-            "padding_mask": padding_mask,
-            "encoder_padding_mask": (
-                encoder_padding_mask if encoder_padding_mask.any() else None
-            ),
+            "encoder_out": x.swapaxes(0, 1),
+            "encoder_padding_mask": encoder_padding_mask.T,
         }
 
 
@@ -375,6 +387,7 @@ def initialize_encoder(
     model_dir: str = None,
     spm: bool = True,
     laser: str = None,
+    batch_size: int = 1,
 ):
     downloader = LaserModelDownloader(model_dir)
     if laser is not None:
@@ -410,7 +423,12 @@ def initialize_encoder(
         # if there is no cvocab for the laser3 lang use laser2 cvocab
         spm_vocab = os.path.join(model_dir, "laser2.cvocab")
 
-    return SentenceEncoder(model_path=model_path, spm_vocab=spm_vocab, spm_model=None)
+    return SentenceEncoder(
+        model_path=model_path,
+        spm_vocab=spm_vocab,
+        spm_model=None,
+        max_sentences=batch_size,
+    )
 
 
 class LaserEncoderPipeline:
@@ -420,6 +438,7 @@ class LaserEncoderPipeline:
         model_dir: str = None,
         spm: bool = True,
         laser: str = None,
+        batch_size: int = 1,
     ):
 
         if laser == "laser2" and lang is not None:
@@ -437,7 +456,11 @@ class LaserEncoderPipeline:
             lang=lang, model_dir=model_dir, laser=laser
         )
         self.encoder = initialize_encoder(
-            lang=lang, model_dir=model_dir, spm=spm, laser=laser
+            lang=lang,
+            model_dir=model_dir,
+            spm=spm,
+            laser=laser,
+            batch_size=batch_size,
         )
 
     def encode_sentences(
