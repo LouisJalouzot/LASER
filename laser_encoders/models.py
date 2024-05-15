@@ -114,9 +114,15 @@ class SentenceEncoder:
             lengths = lengths.cuda()
 
         with torch.no_grad():
-            sentemb = self.encoder(tokens, lengths)["sentemb"]
-        embeddings = sentemb.detach().cpu().numpy()
-        return embeddings
+            encoded_batch = self.encoder(tokens, lengths)
+
+        for key, values in encoded_batch.items():
+            if isinstance(values, torch.Tensor):
+                encoded_batch[key] = values.detach().cpu().numpy()
+            elif isinstance(values, tuple):
+                encoded_batch[key] = tuple(v.detach().cpu().numpy() for v in values)
+
+        return encoded_batch
 
     def _tokenize(self, line):
         tokens = SPACE_NORMALIZER.sub(" ", line).strip().split()
@@ -172,16 +178,41 @@ class SentenceEncoder:
 
     def encode_sentences(self, sentences, normalize_embeddings=False):
         indices = []
-        results = []
+        results = {}
         for batch, batch_indices in self._make_batches(sentences):
             indices.extend(batch_indices)
             encoded_batch = self._process_batch(batch)
             if normalize_embeddings:
                 # Perform L2 normalization on the embeddings
-                norms = np.linalg.norm(encoded_batch, axis=1, keepdims=True)
-                encoded_batch = encoded_batch / norms
-            results.append(encoded_batch)
-        return np.vstack(results)[np.argsort(indices, kind=self.sort_kind)]
+                norms = np.linalg.norm(
+                    encoded_batch["sentemb"],
+                    axis=1,
+                    keepdims=True,
+                )
+                encoded_batch["sentemb"] /= norms
+            for key, values in encoded_batch.items():
+                if isinstance(values, tuple):
+                    if key not in results:
+                        results[key] = tuple([] for _ in values)
+                    for i, v in enumerate(values):
+                        results[key][i].append(v)
+                elif isinstance(values, np.ndarray):
+                    if key not in results:
+                        results[key] = []
+                    results[key].append(values)
+
+        for key, values in results.items():
+            if isinstance(values[0], np.ndarray):
+                results[key] = [
+                    values[i] for i in np.argsort(indices, kind=self.sort_kind)
+                ]
+            elif isinstance(values, tuple):
+                results[key] = tuple(
+                    [v[i] for i in np.argsort(indices, kind=self.sort_kind)]
+                    for v in values
+                )
+
+        return results
 
 
 class LaserTransformerEncoder(TransformerEncoder):
@@ -332,9 +363,10 @@ class LaserLstmEncoder(nn.Module):
         return {
             "sentemb": sentemb,
             "encoder_out": (x, final_hiddens, final_cells),
-            "encoder_padding_mask": encoder_padding_mask
-            if encoder_padding_mask.any()
-            else None,
+            "padding_mask": padding_mask,
+            "encoder_padding_mask": (
+                encoder_padding_mask if encoder_padding_mask.any() else None
+            ),
         }
 
 
@@ -423,4 +455,7 @@ class LaserEncoderPipeline:
         tokenized_sentences = [
             self.tokenizer.tokenize(sentence) for sentence in sentences
         ]
-        return self.encoder.encode_sentences(tokenized_sentences, normalize_embeddings)
+        return self.encoder.encode_sentences(
+            tokenized_sentences,
+            normalize_embeddings,
+        )
